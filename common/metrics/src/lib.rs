@@ -67,6 +67,7 @@ pub use prometheus::{
 
 use anyhow::Result;
 use libra_logger::prelude::*;
+use once_cell::sync::Lazy;
 use prometheus::{proto::MetricType, Encoder, TextEncoder};
 use std::{
     collections::HashMap,
@@ -75,6 +76,19 @@ use std::{
     path::Path,
     thread, time,
 };
+
+const NUM_METRICS_NAME: &str = "num_metrics";
+pub static NUM_METRICS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        NUM_METRICS_NAME,
+        "Number of metrics in certain states",
+        &["state"]
+    )
+    .unwrap()
+});
+
+const MAX_COUNTERS: usize = 1000;
+const METRICS_TO_KEEP: &[&str] = &[NUM_METRICS_NAME];
 
 fn get_metrics_file<P: AsRef<Path>>(dir_path: &P, file_name: &str) -> File {
     create_dir_all(dir_path).expect("Create metrics dir failed");
@@ -90,8 +104,44 @@ fn get_metrics_file<P: AsRef<Path>>(dir_path: &P, file_name: &str) -> File {
         .expect("Open metrics file failed")
 }
 
+pub fn gather_metrics() -> Vec<prometheus::proto::MetricFamily> {
+    let metric_families = prometheus::gather();
+    let mut kept_families: Vec<_> = Vec::new();
+    let mut total: usize = 0;
+    let mut kept_count: usize = 0;
+    for metric_family in metric_families {
+        let family_count = metric_family.get_metric().len();
+
+        if kept_count + family_count <= MAX_COUNTERS
+            || METRICS_TO_KEEP.contains(&metric_family.get_name())
+        {
+            kept_count += family_count;
+            kept_families.push(metric_family);
+        }
+        total += family_count;
+    }
+
+    if kept_count < total {
+        error!(
+            "Metrics: Too many counters >{}.  Kept: {}, Dropped: {}",
+            MAX_COUNTERS,
+            kept_count,
+            total - kept_count
+        );
+    }
+
+    // These metrics will be reported on the next pull
+    NUM_METRICS
+        .with_label_values(&["kept"])
+        .set(kept_count as i64);
+
+    NUM_METRICS.with_label_values(&["total"]).set(total as i64);
+
+    kept_families
+}
+
 fn get_all_metrics_as_serialized_string() -> Result<Vec<u8>> {
-    let all_metrics = prometheus::gather();
+    let all_metrics = gather_metrics();
 
     let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
@@ -102,7 +152,7 @@ fn get_all_metrics_as_serialized_string() -> Result<Vec<u8>> {
 pub fn get_all_metrics() -> HashMap<String, String> {
     // TODO: use an existing metric encoder (same as used by
     // prometheus/metric-server)
-    let all_metric_families = prometheus::gather();
+    let all_metric_families = gather_metrics();
     let mut all_metrics = HashMap::new();
     for metric_family in all_metric_families {
         let values: Vec<_> = match metric_family.get_field_type() {
